@@ -7,7 +7,7 @@ const { decode } = require("entities");
 
 const PORT = process.env.PORT || 7000;
 
-// Logo cez GitHub raw (najjednoduchšie)
+// Logo cez GitHub raw
 const GITHUB_RAW_BASE = "https://raw.githubusercontent.com/Luberda66/Online-Sktorrent-Stremio-addon/main";
 const LOGO_URL = `${GITHUB_RAW_BASE}/online-sktorrent-addon-logo.png`;
 const BACKGROUND_URL = `${GITHUB_RAW_BASE}/sample.png`;
@@ -24,20 +24,23 @@ const builder = addonBuilder({
     ],
     resources: ["stream"],
     idPrefixes: ["tt"],
-    // ✅ aby sa zobrazilo logo v Stremiu
     logo: LOGO_URL,
     background: BACKGROUND_URL
 });
 
 const commonHeaders = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114.0.0.0 Safari/537.36',
-    'Accept-Encoding': 'identity'
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "sk-SK,sk;q=0.9,cs-CZ;q=0.8,cs;q=0.7,en-US;q=0.6,en;q=0.5",
+    "Accept-Encoding": "identity",
+    "Connection": "keep-alive",
 };
 
 const http = axios.create({
-    timeout: 20000,
+    timeout: 25000,
     headers: commonHeaders,
-    maxRedirects: 5
+    maxRedirects: 5,
+    validateStatus: (s) => s >= 200 && s < 500 // nech vidíme aj 403/429 v logu
 });
 
 function removeDiacritics(str) {
@@ -81,7 +84,7 @@ function formatName(fullTitle, flagsArray) {
     return fullTitle + "\n⚙️SKTonline" + (iconStr ? "\n" + iconStr : "");
 }
 
-// ✅ normalizácia pre porovnávanie názvov
+// normalizácia pre porovnávanie názvov
 function norm(str) {
     return removeDiacritics(String(str || ""))
         .toLowerCase()
@@ -89,17 +92,11 @@ function norm(str) {
         .trim();
 }
 
-// ✅ extrakcia roku
 function extractYear(text) {
     const m = String(text || "").match(/\b(19\d{2}|20\d{2})\b/);
     return m ? parseInt(m[1], 10) : null;
 }
 
-/**
- * ✅ Cinemeta (Stremio) – stabilnejšie než IMDb scraping, funguje aj na Renderi
- * movie:  https://v3-cinemeta.stremio.com/meta/movie/tt....json
- * series: https://v3-cinemeta.stremio.com/meta/series/tt....json
- */
 async function getMetaFromCinemeta(type, imdbId) {
     try {
         const url = `https://v3-cinemeta.stremio.com/meta/${type}/${imdbId}.json`;
@@ -108,8 +105,6 @@ async function getMetaFromCinemeta(type, imdbId) {
         const meta = res?.data?.meta;
         if (!meta) return null;
 
-        // meta.name je názov
-        // rok sa dá získať buď priamo, alebo z releaseInfo
         const year =
             (typeof meta.year === "number" ? meta.year : null) ||
             extractYear(meta.releaseInfo) ||
@@ -129,8 +124,13 @@ async function getTitleFromIMDb(imdbId) {
         console.log(`[DEBUG] 🌐 IMDb Request: ${url}`);
         const res = await http.get(url);
 
+        if (res.status >= 400) {
+            console.error(`[ERROR] IMDb status ${res.status}`);
+            return null;
+        }
+
         const $ = cheerio.load(res.data);
-        const titleRaw = $('title').text().split(' - ')[0].trim();
+        const titleRaw = $("title").text().split(" - ")[0].trim();
         const title = decode(titleRaw);
 
         const ldJson = $('script[type="application/ld+json"]').html();
@@ -146,18 +146,49 @@ async function getTitleFromIMDb(imdbId) {
         console.log(`[DEBUG] 🎬 IMDb title: ${title}, original: ${originalTitle}, year: ${year || "N/A"}`);
         return { title, originalTitle, year };
     } catch (err) {
-        // Render často dostane 403 / block -> fallback Cinemeta
         console.error("[ERROR] IMDb scraping zlyhal:", err.message);
         return null;
     }
 }
 
+function looksBlocked(html) {
+    const t = String(html || "").toLowerCase();
+    return (
+        t.includes("captcha") ||
+        t.includes("cloudflare") ||
+        t.includes("attention required") ||
+        t.includes("access denied") ||
+        t.includes("forbidden") ||
+        t.includes("ddos") ||
+        t.includes("bot") ||
+        t.includes("verify you are human")
+    );
+}
+
 async function searchOnlineVideos(query) {
     const searchUrl = `https://online.sktorrent.eu/search/videos?search_query=${encodeURIComponent(query)}`;
     console.log(`[INFO] 🔍 Hľadám '${query}' na ${searchUrl}`);
+
     try {
-        const res = await http.get(searchUrl);
-        const $ = cheerio.load(res.data);
+        // Referer niekedy pomôže
+        const res = await http.get(searchUrl, {
+            headers: {
+                ...commonHeaders,
+                Referer: "https://online.sktorrent.eu/"
+            }
+        });
+
+        console.log(`[DEBUG] 🔎 Search status: ${res.status} content-type: ${res.headers?.["content-type"] || "n/a"}`);
+
+        const html = String(res.data || "");
+        console.log(`[DEBUG] 🔎 Search HTML head: ${html.slice(0, 220).replace(/\s+/g, " ")}`);
+
+        if (res.status === 403 || res.status === 429 || looksBlocked(html)) {
+            console.error(`[ERROR] 🚫 Online.sktorrent blokuje requesty (status=${res.status}). Na hostingu (Render) to často robí anti-bot.`);
+            return [];
+        }
+
+        const $ = cheerio.load(html);
         const links = [];
         $("a[href^='/video/']").each((i, el) => {
             const href = $(el).attr("href");
@@ -178,16 +209,30 @@ async function searchOnlineVideos(query) {
 async function extractStreamsFromVideoId(videoId, ctx) {
     const url = `https://online.sktorrent.eu/video/${videoId}`;
     console.log(`[DEBUG] 🔎 Načítavam detaily videa: ${url}`);
+
     try {
-        const res = await http.get(url);
-        const $ = cheerio.load(res.data);
-        const sourceTags = $('video source');
+        const res = await http.get(url, {
+            headers: {
+                ...commonHeaders,
+                Referer: "https://online.sktorrent.eu/"
+            }
+        });
 
-        // presnejší názov
+        console.log(`[DEBUG] 🔎 Detail status: ${res.status} content-type: ${res.headers?.["content-type"] || "n/a"}`);
+
+        const html = String(res.data || "");
+        if (res.status === 403 || res.status === 429 || looksBlocked(html)) {
+            console.error(`[ERROR] 🚫 Detail page blok (status=${res.status}) videoId=${videoId}`);
+            console.log(`[DEBUG] 🔎 Detail HTML head: ${html.slice(0, 220).replace(/\s+/g, " ")}`);
+            return [];
+        }
+
+        const $ = cheerio.load(html);
+        const sourceTags = $("video source");
+
         const ogTitle = $(`meta[property="og:title"]`).attr("content") || "";
-        const titleText = (ogTitle || $('title').text() || "").trim();
+        const titleText = (ogTitle || $("title").text() || "").trim();
 
-        // film musí obsahovať názov – inak zahodiť
         if (ctx.type === "movie") {
             const nt = norm(titleText);
             const okName =
@@ -199,7 +244,6 @@ async function extractStreamsFromVideoId(videoId, ctx) {
                 return [];
             }
 
-            // rok mismatch filter (keď je rok na stránke)
             if (ctx.year) {
                 const pageYear = extractYear(titleText);
                 if (pageYear && pageYear !== ctx.year) {
@@ -210,13 +254,13 @@ async function extractStreamsFromVideoId(videoId, ctx) {
         }
 
         const flags = extractFlags(titleText);
-
         const streams = [];
+
         sourceTags.each((i, el) => {
-            let src = $(el).attr('src');
-            const label = $(el).attr('label') || 'Unknown';
-            if (src && src.endsWith('.mp4')) {
-                src = src.replace(/([^:])\/\/+/, '$1/');
+            let src = $(el).attr("src");
+            const label = $(el).attr("label") || "Unknown";
+            if (src && src.endsWith(".mp4")) {
+                src = src.replace(/([^:])\/\/+/, "$1/");
                 streams.push({
                     title: formatName(titleText, flags),
                     name: formatTitle(label),
@@ -235,31 +279,29 @@ async function extractStreamsFromVideoId(videoId, ctx) {
 
 builder.defineStreamHandler(async ({ type, id }) => {
     console.log(`\n====== 🎮 STREAM požiadavka: type='${type}', id='${id}' ======`);
+
     const [imdbId, seasonStr, episodeStr] = id.split(":");
     const season = seasonStr ? parseInt(seasonStr) : null;
     const episode = episodeStr ? parseInt(episodeStr) : null;
 
-    // 1) skúsiť IMDb
     let titles = await getTitleFromIMDb(imdbId);
-
-    // 2) fallback na Cinemeta (na Renderi často zachráni všetko)
-    if (!titles) {
-        titles = await getMetaFromCinemeta(type, imdbId);
-    }
-
+    if (!titles) titles = await getMetaFromCinemeta(type, imdbId);
     if (!titles) return { streams: [] };
 
     const { title, originalTitle, year } = titles;
-    const queries = new Set();
 
-    const baseTitles = [title, originalTitle].map(t => String(t || "").replace(/\(.*?\)/g, '').trim()).filter(Boolean);
+    const queries = new Set();
+    const baseTitles = [title, originalTitle]
+        .map(t => String(t || "").replace(/\(.*?\)/g, "").trim())
+        .filter(Boolean);
+
     for (const base of baseTitles) {
         const noDia = removeDiacritics(base);
         const short = shortenTitle(noDia);
         const short1 = shortenTitle(noDia, 1);
 
-        if (type === 'series' && season && episode) {
-            const epTag1 = `S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`;
+        if (type === "series" && season && episode) {
+            const epTag1 = `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`;
             const epTag2 = `${season}x${episode}`;
             [base, noDia, short, short1].forEach(b => {
                 queries.add(`${b} ${epTag1}`);
@@ -288,10 +330,8 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
         for (const vid of videoIds) {
             const streams = await extractStreamsFromVideoId(vid, ctx);
-
             for (const s of streams) {
                 if (!s || !s.url) continue;
-
                 if (seenUrls.has(s.url)) continue;
 
                 const itemKey = `${s.name}||${s.title}`;
