@@ -84,7 +84,6 @@ function formatName(fullTitle, flagsArray) {
     return fullTitle + "\n⚙️SKTonline" + (iconStr ? "\n" + iconStr : "");
 }
 
-// normalizácia pre porovnávanie názvov
 function norm(str) {
     return removeDiacritics(String(str || ""))
         .toLowerCase()
@@ -165,12 +164,36 @@ function looksBlocked(html) {
     );
 }
 
+// ✅ helper: robustne vytiahne video IDs z HTML (DOM + regex fallback)
+function extractVideoIdsFromHtml(html) {
+    const ids = new Set();
+
+    // 1) DOM spôsob (a href * /video/)
+    const $ = cheerio.load(html);
+    $("a[href*='/video/']").each((i, el) => {
+        const href = $(el).attr("href") || "";
+        const m = href.match(/\/video\/(\d+)/);
+        if (m) ids.add(m[1]);
+    });
+
+    // 2) regex fallback (ak sú linky schované v JS / iných tagoch)
+    if (ids.size === 0) {
+        const re = /\/video\/(\d+)/g;
+        let m;
+        while ((m = re.exec(html)) !== null) {
+            ids.add(m[1]);
+            if (ids.size >= 50) break; // safety limit
+        }
+    }
+
+    return Array.from(ids);
+}
+
 async function searchOnlineVideos(query) {
     const searchUrl = `https://online.sktorrent.eu/search/videos?search_query=${encodeURIComponent(query)}`;
     console.log(`[INFO] 🔍 Hľadám '${query}' na ${searchUrl}`);
 
     try {
-        // Referer niekedy pomôže
         const res = await http.get(searchUrl, {
             headers: {
                 ...commonHeaders,
@@ -181,25 +204,28 @@ async function searchOnlineVideos(query) {
         console.log(`[DEBUG] 🔎 Search status: ${res.status} content-type: ${res.headers?.["content-type"] || "n/a"}`);
 
         const html = String(res.data || "");
-        console.log(`[DEBUG] 🔎 Search HTML head: ${html.slice(0, 220).replace(/\s+/g, " ")}`);
+        const htmlLen = html.length;
+        const hasVideo = html.includes("/video/");
+        const head = html.slice(0, 260);
+        const titleMatch = html.match(/<title[^>]*>(.*?)<\/title>/i);
+        const pageTitle = titleMatch ? titleMatch[1].replace(/\s+/g, " ").trim() : "N/A";
+
+        console.log(`[DEBUG] 🔎 Search htmlLen=${htmlLen} has'/video/'=${hasVideo} title='${pageTitle}'`);
+        console.log(`[DEBUG] 🔎 Search head(raw): ${JSON.stringify(head)}`);
 
         if (res.status === 403 || res.status === 429 || looksBlocked(html)) {
-            console.error(`[ERROR] 🚫 Online.sktorrent blokuje requesty (status=${res.status}). Na hostingu (Render) to často robí anti-bot.`);
+            console.error(`[ERROR] 🚫 Online.sktorrent blokuje requesty (status=${res.status}).`);
             return [];
         }
 
-        const $ = cheerio.load(html);
-        const links = [];
-        $("a[href^='/video/']").each((i, el) => {
-            const href = $(el).attr("href");
-            if (href) {
-                const match = href.match(/\/video\/(\d+)/);
-                if (match) links.push(match[1]);
-            }
-        });
+        const ids = extractVideoIdsFromHtml(html);
 
-        console.log(`[INFO] 📺 Nájdených videí: ${links.length}`);
-        return links;
+        console.log(`[INFO] 📺 Nájdených videí: ${ids.length}`);
+        if (ids.length > 0) {
+            console.log(`[DEBUG] 🔎 Prvé videoId: ${ids.slice(0, 10).join(", ")}`);
+        }
+
+        return ids;
     } catch (err) {
         console.error("[ERROR] ❌ Vyhľadávanie online videí zlyhalo:", err.message);
         return [];
@@ -223,7 +249,7 @@ async function extractStreamsFromVideoId(videoId, ctx) {
         const html = String(res.data || "");
         if (res.status === 403 || res.status === 429 || looksBlocked(html)) {
             console.error(`[ERROR] 🚫 Detail page blok (status=${res.status}) videoId=${videoId}`);
-            console.log(`[DEBUG] 🔎 Detail HTML head: ${html.slice(0, 220).replace(/\s+/g, " ")}`);
+            console.log(`[DEBUG] 🔎 Detail head(raw): ${JSON.stringify(html.slice(0, 260))}`);
             return [];
         }
 
