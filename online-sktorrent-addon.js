@@ -32,7 +32,8 @@ const commonHeaders = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "sk-SK,sk;q=0.9,cs-CZ;q=0.8,cs;q=0.7,en-US;q=0.6,en;q=0.5",
-    "Accept-Encoding": "identity",
+    // ❗️NEPOUŽÍVAŤ identity – nech server pošle gzip/br normálne
+    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
 };
 
@@ -40,6 +41,7 @@ const http = axios.create({
     timeout: 25000,
     headers: commonHeaders,
     maxRedirects: 5,
+    decompress: true,
     validateStatus: (s) => s >= 200 && s < 500 // nech vidíme aj 403/429 v logu
 });
 
@@ -94,6 +96,41 @@ function norm(str) {
 function extractYear(text) {
     const m = String(text || "").match(/\b(19\d{2}|20\d{2})\b/);
     return m ? parseInt(m[1], 10) : null;
+}
+
+// ✅ Robustné načítanie HTML ako buffer + vlastné dekódovanie na string
+function bufferToText(buf, headers = {}) {
+    try {
+        const ct = (headers["content-type"] || headers["Content-Type"] || "").toLowerCase();
+        // typicky UTF-8, ale necháme šancu na charset=
+        const m = ct.match(/charset=([a-z0-9\-_]+)/i);
+        const charset = (m && m[1]) ? m[1].toLowerCase() : "utf-8";
+
+        // TextDecoder v Node dáva najistejšie utf-8. Iné charsety sa môžu líšiť,
+        // ale sktorrent býva utf-8.
+        const td = new TextDecoder(charset === "utf8" ? "utf-8" : charset);
+        return td.decode(buf);
+    } catch (e) {
+        // fallback
+        return Buffer.from(buf || "").toString("utf8");
+    }
+}
+
+async function getHtml(url, extra = {}) {
+    const res = await http.get(url, {
+        ...extra,
+        responseType: "arraybuffer"
+    });
+
+    const enc = res.headers?.["content-encoding"] || "n/a";
+    const clen = res.headers?.["content-length"] || "n/a";
+    const ten = res.headers?.["transfer-encoding"] || "n/a";
+    const ctype = res.headers?.["content-type"] || "n/a";
+    console.log(`[DEBUG] 🌐 GET ${url}`);
+    console.log(`[DEBUG] ↳ status=${res.status} content-type=${ctype} content-encoding=${enc} content-length=${clen} transfer-encoding=${ten}`);
+
+    const html = bufferToText(res.data, res.headers);
+    return { res, html };
 }
 
 async function getMetaFromCinemeta(type, imdbId) {
@@ -168,7 +205,6 @@ function looksBlocked(html) {
 function extractVideoIdsFromHtml(html) {
     const ids = new Set();
 
-    // 1) DOM spôsob (a href * /video/)
     const $ = cheerio.load(html);
     $("a[href*='/video/']").each((i, el) => {
         const href = $(el).attr("href") || "";
@@ -176,13 +212,12 @@ function extractVideoIdsFromHtml(html) {
         if (m) ids.add(m[1]);
     });
 
-    // 2) regex fallback (ak sú linky schované v JS / iných tagoch)
     if (ids.size === 0) {
         const re = /\/video\/(\d+)/g;
         let m;
         while ((m = re.exec(html)) !== null) {
             ids.add(m[1]);
-            if (ids.size >= 50) break; // safety limit
+            if (ids.size >= 50) break;
         }
     }
 
@@ -194,16 +229,13 @@ async function searchOnlineVideos(query) {
     console.log(`[INFO] 🔍 Hľadám '${query}' na ${searchUrl}`);
 
     try {
-        const res = await http.get(searchUrl, {
+        const { res, html } = await getHtml(searchUrl, {
             headers: {
                 ...commonHeaders,
                 Referer: "https://online.sktorrent.eu/"
             }
         });
 
-        console.log(`[DEBUG] 🔎 Search status: ${res.status} content-type: ${res.headers?.["content-type"] || "n/a"}`);
-
-        const html = String(res.data || "");
         const htmlLen = html.length;
         const hasVideo = html.includes("/video/");
         const head = html.slice(0, 260);
@@ -213,17 +245,15 @@ async function searchOnlineVideos(query) {
         console.log(`[DEBUG] 🔎 Search htmlLen=${htmlLen} has'/video/'=${hasVideo} title='${pageTitle}'`);
         console.log(`[DEBUG] 🔎 Search head(raw): ${JSON.stringify(head)}`);
 
-        if (res.status === 403 || res.status === 429 || looksBlocked(html)) {
-            console.error(`[ERROR] 🚫 Online.sktorrent blokuje requesty (status=${res.status}).`);
+        if (res.status === 403 || res.status === 429 || looksBlocked(html) || htmlLen === 0) {
+            console.error(`[ERROR] 🚫 Online.sktorrent blokuje/vracia prázdno (status=${res.status}, htmlLen=${htmlLen}).`);
             return [];
         }
 
         const ids = extractVideoIdsFromHtml(html);
 
         console.log(`[INFO] 📺 Nájdených videí: ${ids.length}`);
-        if (ids.length > 0) {
-            console.log(`[DEBUG] 🔎 Prvé videoId: ${ids.slice(0, 10).join(", ")}`);
-        }
+        if (ids.length > 0) console.log(`[DEBUG] 🔎 Prvé videoId: ${ids.slice(0, 10).join(", ")}`);
 
         return ids;
     } catch (err) {
@@ -237,18 +267,15 @@ async function extractStreamsFromVideoId(videoId, ctx) {
     console.log(`[DEBUG] 🔎 Načítavam detaily videa: ${url}`);
 
     try {
-        const res = await http.get(url, {
+        const { res, html } = await getHtml(url, {
             headers: {
                 ...commonHeaders,
                 Referer: "https://online.sktorrent.eu/"
             }
         });
 
-        console.log(`[DEBUG] 🔎 Detail status: ${res.status} content-type: ${res.headers?.["content-type"] || "n/a"}`);
-
-        const html = String(res.data || "");
-        if (res.status === 403 || res.status === 429 || looksBlocked(html)) {
-            console.error(`[ERROR] 🚫 Detail page blok (status=${res.status}) videoId=${videoId}`);
+        if (res.status === 403 || res.status === 429 || looksBlocked(html) || html.length === 0) {
+            console.error(`[ERROR] 🚫 Detail page blok/prázdno (status=${res.status}) videoId=${videoId}`);
             console.log(`[DEBUG] 🔎 Detail head(raw): ${JSON.stringify(html.slice(0, 260))}`);
             return [];
         }
